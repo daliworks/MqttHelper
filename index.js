@@ -10,46 +10,154 @@ var mqtt = require('mqtt'),
  * @param {Number} [port] - broker port
  * @param {String} [host] - broker host
  * @param {Object} [opts] - keepalive, clientId, retryTimeout
+ * @param {Boolean} [tlsOptions] - whether or not to retain the message
  * @api public
  */
-function MqttHelper(port, host, opts) {
-  if (null == port || null == host) {
+function MqttHelper(port, host, opts, secure) {
+  if (!port || !host) {
     throw new Error('port and host are required');
   }
-  if (null == opts) {
+  if (!opts) {
     opts = {};
   }
 
   this.port = port;
   this.host = host;
   this.opts = opts;
+  this.secure = secure;
+
+  this.client = null;
+  this.waitCloseTimer = null;
+  this._cache = [];
+  this._index = 0;
+
+  opts.reconnectPeriod = 0;
+  opts.retryTimeout = opts.retryTimeout || 2*60*1000;
+  opts.waitCloseTimeout = opts.waitCloseTimeout || 60* 1000;
 
   var self = this;
 
   (function init() {
     var client;
 
-    self.client = client = mqtt.createClient(self.port, self.host, self.opts),
+    console.info('MqttHelper - init()');
 
-    client.on('connect', self.emit.bind(self, 'connect'));
+    self.reinitTimer = null;
+
+    if (self.client) {
+      return;
+    }
+
+    if (true === secure) {
+      self.client = client = mqtt.createSecureClient(self.port, self.host, self.opts);
+    } else {
+      self.client = client = mqtt.createClient(self.port, self.host, self.opts);
+    }
+
     client.on('message', self.emit.bind(self, 'message'));
-
-    client.on('error', function () {
-      console.error('error');
-      self.client = null;
-      this.end();
+    client.on('connect', function() {
+      self.emit('connect');
+      self._publish();
     });
     client.on('close', function (err) {
-      console.error('closed');
+      if (self.client) {
+        self.client.destroy();
       self.client = null;
-      this.end();
-      setTimeout(init.bind(self), self.opts.retryTimeout * 1000 || 60 * 1000);
+      }
+      
+      if (self.waitCloseTimer) {
+        clearTimeout(self.waitCloseTimer);
+        self.waitCloseTimer = null;
+      }
+
+      if (self.reinitTimer) { //alrady client is crated or under creating
+      self.emit('close');
+        return;
+      }
+     
+      self.reinitTimer = setTimeout(init.bind(self), self.opts.retryTimeout);
       self.emit('close');
     });
+    client.on('error', function () {
+      if (self.client) {
+        self.client.destroy();
+        self.client = null;
+      }
+
+      if (self.waitCloseTimer) {
+        clearTimeout(self.waitCloseTimer);
+        self.waitCloseTimer = null;
+      }
+
+      if (self.reinitTimer) { //alrady client is crated or under creating
+        self.emit('error');
+        return;
+      }
+
+      self.reinitTimer = setTimeout(init.bind(self), self.opts.retryTimeout);
+      self.emit('error');
+    });
   })();
-}
+};
+
+MqttHelper.MAX_CACHE_COUNT = 1000
 
 util.inherits(MqttHelper, events.EventEmitter);
+
+MqttHelper.prototype._publish = function () {
+  var self,
+      cache,
+      index;
+
+  if (!this.client) { // disconnect
+    return;
+  }
+
+  if (0 === this._cache.length) { // nothing to send
+    return;
+  }
+
+  if (this.waitCloseTimer) { // under sending
+    return;
+  }
+
+  self = this;
+  cache = this._cache[0];
+  
+  this.waitCloseTimer = setTimeout(function() {
+     console.warn('waitCloseTimer out : try disconnect');
+      self.waitCloseTimer = null;
+      if (self.client) {
+         self.client.destroy();
+         self.client = null;
+}
+    }, this.opts.waitCloseTimeout);
+
+  index = cache.index;
+  this.client.publish(cache.topic, cache.message, cache.opts, function (err) {
+    if (err) {
+      console.warn('MqttHelper.publish/callback error', err);
+    }
+
+    if (self.waitCloseTimer) {
+      clearTimeout(self.waitCloseTimer);
+      self.waitCloseTimer = null;
+    }
+
+    if (0 === self._cache.length) { // nothing to send
+      console.error('MqttHelper.publish/callback : cache.length is 0');
+      return;
+    }
+
+    if (index === self._cache[0].index) {
+      self._cache.shift();
+    } else {
+      console.warn('MqttHelper._publish/callback : mismatch index', index, self._cache[0].index);
+    }
+
+    self._publish();
+  });
+};
 
 // same as MQTT.js client.publish
 /**
@@ -70,12 +178,18 @@ util.inherits(MqttHelper, events.EventEmitter);
  *     client.publish('topic', 'message', {qos: 1, retain: true});
  * @example client.publish('topic', 'message', console.log);
  */
-MqttHelper.prototype.publish = function () {
-  if (this.client) {
-    this.client.publish.apply(this.client, arguments);
+MqttHelper.prototype.publish = function (topic, message, opts) {
+  if (this._cache.length <= MqttHelper.MAX_CACHE_COUNT) {
+    this._cache.push({index : this._index++, topic : topic, message : message, opts : opts});
+
+    if (this._cache.length > 1) {
+      console.warn('MqttHelper.publish : add queue / length', this._cache.length);
+    }
   } else {
-    throw new Error('not connected');
+    console.error('MqttHelper.publish : cache full (%d)', MqttHelper.MAX_CACHE_COUNT);
   }
+
+  this._publish();
 };
 
 // same as MQTT.js client.subscribe
@@ -98,7 +212,7 @@ MqttHelper.prototype.subscribe = function () {
   if (this.client) {
     this.client.subscribe.apply(this.client, arguments);
   } else {
-    throw new Error('not connected');
+    console.error('MqttHelper.subscribe fail');
   }
 };
 
@@ -106,16 +220,24 @@ module.exports = MqttHelper;
 
 // EXAMPLE
 /*
-var mh = new MqttHelper(1883, '192.168.1.101', {clientId: 'pi1', keepalive: 30});
+var topic = 'MqttHelper/test';
+var opts = {clientId: 'MqttHelper', keepalive: 60, clean: true,
+              will: {topic: topic, payload: 'err - disconnect client', retain: true},
+              retryTimeout: 10*1000, waitCloseTimeout: 30*1000};
+var mh = new MqttHelper(PORT, 'IP', opts, false);
 
+var index = 0;
 setInterval(function () {
-  mh.publish('pi1/temp1', Math.floor(Math.random() * 20).toString(), {qos: 1, retain: true}, function () { });
-}, 5000);
+  mh.publish(topic, (++index).toString(), {qos: 1, retain: true}, function () { });
+}, 1000);
 
 mh.on('connect', function () {
   console.log('connected');
+
   this.subscribe('pi1/temp1', {qos: 1}, function (err, granted) {
-    if (err) { console.error('subscribe error:', err); } 
+    if (err) {
+      console.error('subscribe error:', err);
+    }
   });
 });
 
@@ -124,6 +246,7 @@ mh.on('message', function (topic, message, packet) {
 });
 
 mh.on('close', function () {
+  console.log('closed');
   // this.unsubscribe()...
 });
 */

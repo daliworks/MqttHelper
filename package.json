@@ -4,9 +4,9 @@
   "version": "0.0.2",
   "main": "index.js",
   "engines": {
-    "node": ">=0.8.6"
+    "node": "0.8.x"
   },
   "dependencies": {
-    "mqtt": "0.2.9"
+    "mqtt": "git+https://github.com/daliworks/MQTT.js.git"
   }
 }
